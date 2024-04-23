@@ -4,13 +4,13 @@ import os
 import random
 import textwrap
 from collections import Counter, defaultdict
-
+import torch
 import faiss
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.express as px
-from huggingface_hub import InferenceClient
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import DBSCAN
 from tqdm import tqdm
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 DEFAULT_INSTRUCTION = (
     instruction
 ) = "Use three words total (comma separated)\
-to describe general topics in above texts. Under no circumstances use enumeration. \
+to describe general topics in above texts. Under no circumstances use enumeration. Under no circumstances will your response contain more than 3 words total. \
 Example format: Tree, Cat, Fireman"
 
 DEFAULT_TEMPLATE = "<s>[INST]{examples}\n\n{instruction}[/INST]"
@@ -32,7 +32,7 @@ class ClusterClassifier:
     def __init__(
         self,
         embed_model_name="all-MiniLM-L6-v2",
-        embed_device="cpu",
+        embed_device="cuda",
         embed_batch_size=64,
         embed_max_seq_length=512,
         embed_agg_strategy=None,
@@ -42,7 +42,7 @@ class ClusterClassifier:
         dbscan_min_samples=50,
         dbscan_n_jobs=16,
         summary_create=True,
-        summary_model="mistralai/Mixtral-8x7B-Instruct-v0.1",
+        summary_model="meta-llama/Meta-Llama-3-8B-Instruct",
         topic_mode="multiple_topics",
         summary_n_examples=10,
         summary_chunk_size=420,
@@ -179,7 +179,13 @@ class ClusterClassifier:
 
     def summarize(self, texts, labels):
         unique_labels = len(set(labels)) - 1  # exclude the "-1" label
-        client = InferenceClient(self.summary_model, token=self.summary_model_token)
+        model = AutoModelForCausalLM.from_pretrained(
+                "meta-llama/Meta-Llama-3-8B-Instruct",
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+            )
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+
         cluster_summaries = {-1: "None"}
 
         for label in range(unique_labels):
@@ -190,11 +196,32 @@ class ClusterClassifier:
                     for i, _id in enumerate(ids)
                 ]
             )
+            request = [
+                {"role": "system", "content": f"{self.summary_instruction}"},
+                {"role": "user", "content": f"{examples}"},
+]
+            
+            input_ids = tokenizer.apply_chat_template(
+                        request,
+                        add_generation_prompt=True,
+                        return_tensors="pt"
+                    ).to(model.device)
+            
+            terminators = [
+                tokenizer.eos_token_id,
+                tokenizer.convert_tokens_to_ids("<|eot_id|>")
+            ]
 
-            request = self.summary_template.format(
-                examples=examples, instruction=self.summary_instruction
-            )
-            response = client.text_generation(request)
+            outputs = model.generate(
+                                        input_ids,
+                                        max_new_tokens=256,
+                                        eos_token_id=terminators,
+                                        do_sample=True,
+                                        temperature=0.6,
+                                        top_p=0.9,
+                                    )
+            response = tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
+
             if label == 0:
                 print(f"Request:\n{request}")
             cluster_summaries[label] = self._postprocess_response(response)
@@ -290,7 +317,7 @@ class ClusterClassifier:
             y = np.mean([self.projections[doc, 1] for doc in self.label2docs[label]])
             self.cluster_centers[label] = (x, y)
 
-    def show(self, interactive=False):
+    def show(self, interactive=True):
         df = pd.DataFrame(
             data={
                 "X": self.projections[:, 0],
@@ -342,6 +369,9 @@ class ClusterClassifier:
         ax.set_axis_off()
 
     def _show_plotly(self, df):
+        
+        df["labels"] = df["labels"].astype(str)
+
         fig = px.scatter(
             df,
             x="X",
@@ -350,18 +380,13 @@ class ClusterClassifier:
             hover_data={"content_display": True, "X": False, "Y": False},
             width=1600,
             height=800,
-            color_continuous_scale="HSV",
         )
 
         fig.update_traces(hovertemplate="%{customdata[0]}<extra></extra>")
 
         fig.update_traces(
-            marker=dict(size=1, opacity=0.8),  # color="white"
+            marker=dict(size=3, opacity=0.8),  # color="white"
             selector=dict(mode="markers"),
-        )
-
-        fig.update_layout(
-            template="plotly_dark",
         )
 
         # show cluster summaries
